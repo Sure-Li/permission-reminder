@@ -45,8 +45,8 @@ from ..mailer.outbox import (
     open_in_mail_client, outbox_dir,
 )
 from ..mailer.sender import (
-    SMTP_PRESETS, MailSendError, EmailSender, auth_block_remaining,
-    find_invalid_recipients, render_summary_email, reset_auth_block,
+    SMTP_PRESETS, Attachment, MailSendError, EmailSender, auth_block_remaining,
+    build_excel_attachment, find_invalid_recipients, render_summary_email, reset_auth_block,
     send_test_email,
 )
 from .diag_window import show_diag_report
@@ -441,7 +441,7 @@ class MainWindow(tk.Tk):
         """选择 Excel 文件并持久化路径。"""
         path = filedialog.askopenfilename(
             title="选择客户权限 Excel 文件",
-            filetypes=[("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")],
+            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")],
         )
         if not path:
             return
@@ -726,16 +726,20 @@ class MainWindow(tk.Tk):
         self._run_check_threaded(export_only=True)
 
     def _export_and_handoff(self, cfg: AppConfig, items: List[ReminderItem],
-                            subject: str, html: str, plain: str) -> None:
+                            subject: str, html: str, plain: str,
+                            attachments: Optional[List[Attachment]] = None) -> None:
         """兜底通道：导出 .eml/.html 并唤起本机邮件客户端（工作线程中执行）。
 
         刻意**不在这里标记已发**：邮件最终是否发出由用户决定，
         由主线程弹窗确认后再标记，避免"其实没发出去却被当成已提醒"。
         """
+        if attachments is None:
+            attachments = [build_excel_attachment(items)]
         try:
             eml_path, html_path = export_mail(
                 cfg.smtp.recipients, subject, html, plain,
                 from_addr=cfg.smtp.username, tag="权限到期提醒",
+                attachments=attachments,
             )
         except OSError as exc:
             logger.error("导出提醒邮件失败：%s", exc)
@@ -753,12 +757,13 @@ class MainWindow(tk.Tk):
         step: Optional[str] = None
         if foxmail_exe:
             try:
-                argv = open_foxmail_compose(foxmail_exe, cfg.foxmail_mode, str(eml_path),
+                mode = "eml" if attachments else cfg.foxmail_mode
+                argv = open_foxmail_compose(foxmail_exe, mode, str(eml_path),
                                             cfg.smtp.recipients, subject, plain)
                 opened = True
                 logger.info("已用 Foxmail 投递：%s", argv)
-                step = (f"已唤起 Foxmail 投递（{foxmail_summary(foxmail_exe, cfg.foxmail_mode)}），"
-                        "请在其中点「发送」完成投递。")
+                step = (f"已唤起 Foxmail 打开完整邮件（{foxmail_summary(foxmail_exe, mode)}），"
+                        "Excel 附件已包含在 .eml 中，请再次编辑或转发后确认附件并发送。")
             except FoxmailError as exc:
                 logger.warning("唤起 Foxmail 失败，回退到系统默认客户端：%s", exc)
                 step = None
@@ -766,14 +771,15 @@ class MainWindow(tk.Tk):
         if not opened and step is None:
             client = describe_mail_client() or "未知"
             try:
-                opened = open_in_mail_client(cfg.smtp.recipients, subject, plain)
+                opened = open_in_mail_client(cfg.smtp.recipients, subject, plain,
+                                             eml_path=eml_path if attachments else None)
             except OSError as exc:
                 logger.warning("唤起本机邮件客户端失败：%s", exc)
                 opened = False
             if opened:
                 step = (f"未使用 Foxmail（未集成或唤起失败），"
-                        f"已唤起系统默认客户端「{client}」的新建邮件窗口，"
-                        "请在其中点「发送」完成投递。\n"
+                        f"已请求系统打开包含 Excel 附件的完整 .eml 邮件，"
+                        "请确认使用单位邮件客户端，再次编辑或转发并发送。\n"
                         "提示：也可在界面「Foxmail」一栏点「自动检测」完成集成，"
                         "以后优先用 Foxmail 投递。")
             else:
@@ -1185,13 +1191,15 @@ class MainWindow(tk.Tk):
         # 5. 渲染汇总邮件
         subject = "【权限到期提醒】"
         html, plain = render_summary_email(items, today)
+        attachments = [build_excel_attachment(items)]
 
         # 5a. 只导出：落盘即结束，不发送、不标记已发
         if export_only:
             try:
                 eml, html_path = export_mail(
                     cfg.smtp.recipients, subject, html, plain,
-                    from_addr=cfg.smtp.username, tag="权限到期提醒")
+                    from_addr=cfg.smtp.username, tag="权限到期提醒",
+                    attachments=attachments)
             except OSError as exc:
                 logger.error("导出提醒邮件失败：%s", exc)
                 self._ui_queue.put({"type": "error", "title": "导出失败",
@@ -1208,12 +1216,14 @@ class MainWindow(tk.Tk):
 
         # 5b. 兜底通道：导出 + 唤起本机邮件客户端（由用户确认后再标记已发）
         if cfg.send_mode == "client":
-            self._export_and_handoff(cfg, items, subject, html, plain)
+            self._export_and_handoff(cfg, items, subject, html, plain,
+                                      attachments=attachments)
             return
 
         # 5c. SMTP 直发
         try:
-            EmailSender(cfg.smtp).send(cfg.smtp.recipients, subject, html, plain)
+            EmailSender(cfg.smtp).send(cfg.smtp.recipients, subject, html, plain,
+                                       attachments=attachments)
         except MailSendError as exc:
             logger.error("提醒邮件发送失败（%d 项未标记已发，下次将重试）：%s", len(items), exc)
             self._ui_queue.put({"type": "error", "title": "邮件发送失败", "message": str(exc)})

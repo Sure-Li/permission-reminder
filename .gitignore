@@ -19,6 +19,21 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 本机凭据与环境配置 ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+/credentials.json
+/secrets.json
 
 # ---- PyInstaller 构建中间产物 ----
 build/
@@ -35,4 +50,5 @@ dist/*
 .idea/
 Thumbs.db
 desktop.ini
+*.lnk
 *~

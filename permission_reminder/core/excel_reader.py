@@ -4,7 +4,7 @@
 职责：用 pandas 读取客户私募资管权限 Excel，解析为 ClientRecord 列表。
 
 真实数据特征（必须兼容）：
-- 第 1 行是合并大标题，真正的列名在第 2 行（header=1）；
+- 自动识别表头行，兼容合并标题、列名空白与常见客户信息列名别称；
 - 日期单元格是 int 型 YYYYMMDD（如 20261021），也可能是 str / datetime /
   Excel 序列号；
 - 客户姓名可能是数字（脏数据）、客户号可能为空、存在整行空行。
@@ -31,6 +31,12 @@ EXPIRY_COLUMN_MAP: Dict[str, str] = {
 
 # 必须存在的列（客户信息 + 三个到期日期列）
 REQUIRED_COLUMNS = ["客户号", "客户姓名", *EXPIRY_COLUMN_MAP.keys()]
+
+COLUMN_ALIASES = {
+    "客户名称": "客户姓名",
+    "客户名": "客户姓名",
+    "客户编号": "客户号",
+}
 
 # Excel 序列号纪元基准（1900 日期系统，含 Lotus 1-2-3 的闰年 bug 偏移）
 _EXCEL_EPOCH_ORDINAL = date(1899, 12, 30).toordinal()
@@ -115,31 +121,71 @@ def parse_date_cell(value: Any) -> Optional[date]:
     return None
 
 
+def _normalise_header(value: Any) -> str:
+    """去除列名中的空白，并将客户信息列别名转换为标准列名。"""
+    if _is_nan_like(value):
+        return ""
+    name = "".join(str(value).split())
+    return COLUMN_ALIASES.get(name, name)
+
+
+def _find_header(raw: pd.DataFrame) -> tuple[int, List[str]]:
+    """寻找完整表头；不完整时用最接近表头的一行说明缺失列。"""
+    required = set(REQUIRED_COLUMNS)
+    best_index: int | None = None
+    best_headers: List[str] = []
+    best_matches = 0
+    for idx, row in raw.iterrows():
+        headers = [_normalise_header(value) for value in row]
+        matches = len(required.intersection(headers))
+        if matches > best_matches:
+            best_index, best_headers, best_matches = int(idx), headers, matches
+        if matches == len(required):
+            break
+
+    if best_index is None:
+        raise ExcelFormatError(
+            "未找到包含客户信息和权限到期日期的表头行。\n"
+            f"所需列名：{'、'.join(REQUIRED_COLUMNS)}"
+        )
+
+    duplicates = sorted(name for name in required if best_headers.count(name) > 1)
+    if duplicates:
+        raise ExcelFormatError(
+            f"Excel 第 {best_index + 1} 行表头包含重复列：{'、'.join(duplicates)}。\n"
+            "列名别称和空白规范化后，客户信息和权限到期日期列必须唯一。"
+        )
+    missing = [name for name in REQUIRED_COLUMNS if name not in best_headers]
+    if missing:
+        raise ExcelFormatError(
+            f"Excel 缺少关键列：{'、'.join(missing)}。\n"
+            f"实际列名：{'、'.join(name for name in best_headers if name)}"
+        )
+    return best_index, best_headers
+
+
 def read_clients(path: str | Path) -> List[ClientRecord]:
     """读取 Excel（第一个 sheet）并解析为客户记录列表。
 
     Raises:
-        ExcelFormatError: 文件不存在 / 读取失败 / 关键列缺失。
+        ExcelFormatError: 文件不存在 / 读取失败 / 关键列缺失或重复。
     """
     p = Path(path)
     if not p.exists():
         raise ExcelFormatError(f"Excel 文件不存在：{p}")
-    if p.suffix.lower() not in (".xlsx", ".xls"):
+    if p.suffix.lower() not in (".xlsx", ".xls", ".xlsm"):
         raise ExcelFormatError(f"不是有效的 Excel 文件：{p.name}")
 
     try:
-        # 第 1 行是合并大标题，真列名在第 2 行 -> header=1
-        df = pd.read_excel(p, header=1, dtype=object, engine="openpyxl")
+        raw = pd.read_excel(p, sheet_name=0, header=None, dtype=object, engine="openpyxl")
     except Exception as exc:  # noqa: BLE001 —— 统一转成业务异常
         raise ExcelFormatError(f"Excel 读取失败：{exc}") from exc
 
-    # 按列名匹配（非位置），检查关键列
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ExcelFormatError(
-            f"Excel 缺少关键列：{'、'.join(missing)}。\n"
-            f"实际列名：{'、'.join(str(c) for c in df.columns)}"
-        )
+    header_index, headers = _find_header(raw)
+    # 只解析必需的业务列，额外的重复备注列或空列不影响客户记录读取。
+    business_columns = [idx for idx, name in enumerate(headers) if name in REQUIRED_COLUMNS]
+    df = raw.iloc[header_index + 1:, business_columns].copy()
+    df.columns = [headers[idx] for idx in business_columns]
 
     records: List[ClientRecord] = []
     skipped = 0
@@ -148,7 +194,7 @@ def read_clients(path: str | Path) -> List[ClientRecord]:
         if _is_nan_like(cid):
             # 空行或无客户号的行：跳过（整行全空不计警告）
             if not all(_is_nan_like(row[c]) for c in df.columns):
-                logger.warning("第 %d 行客户号为空，已跳过", idx + 3)  # +3: 标题行+表头行+1基
+                logger.warning("第 %d 行客户号为空，已跳过", idx + 1)
                 skipped += 1
             continue
         name = row["客户姓名"]

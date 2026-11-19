@@ -14,10 +14,13 @@ import smtplib
 import socket
 import ssl
 import time
+from datetime import datetime
 from email.header import Header
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import List, Optional, Tuple
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple
 
 from ..core.checker import ReminderItem
 from ..infra.config_store import SmtpConfig
@@ -26,6 +29,18 @@ logger = logging.getLogger(__name__)
 
 # 主题固定为【权限到期提醒】
 SUBJECT = "【权限到期提醒】"
+
+Attachment = Tuple[str, bytes]
+PERMISSION_COLUMNS = ("专业投资者权限", "私募基金权限", "资管权限")
+TABLE_COLUMNS = ("客户号", "客户名称", *PERMISSION_COLUMNS)
+_PERMISSION_COLUMN = {
+    "专业投资者": "专业投资者权限",
+    "私募基金": "私募基金权限",
+    "资管权限": "资管权限",
+    "专业投资者权限": "专业投资者权限",
+    "私募基金权限": "私募基金权限",
+    "私募资管权限": "资管权限",
+}
 
 # SMTP 超时与重试
 SMTP_TIMEOUT_SECONDS = 15
@@ -75,17 +90,27 @@ class MailSendError(Exception):
 
 
 def build_mime_message(from_addr: str, recipients: List[str], subject: str,
-                       html_body: str, plain_body: str) -> MIMEMultipart:
+                       html_body: str, plain_body: str,
+                       attachments: Optional[List[Attachment]] = None) -> MIMEMultipart:
     """构建 MIME 邮件（UTF-8，纯文本 + HTML 双格式）。
 
     SMTP 直发与「导出为 .eml」两条通道共用同一实现，保证两者内容完全一致。
     """
-    msg = MIMEMultipart("alternative")
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(plain_body, "plain", "utf-8"))
+    body.attach(MIMEText(html_body, "html", "utf-8"))
+    msg = MIMEMultipart("mixed") if attachments else body
     msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = from_addr
     msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    if attachments:
+        msg.attach(body)
+        for filename, content in attachments:
+            attachment = MIMEApplication(
+                content, _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            attachment.add_header("Content-Disposition", "attachment",
+                                  filename=("utf-8", "", filename))
+            msg.attach(attachment)
     return msg
 
 
@@ -296,7 +321,8 @@ class EmailSender:
     # -------------------------------------------------------------- 对外接口 --
 
     def send(self, recipients: List[str], subject: str,
-             html_body: str, plain_body: str) -> None:
+             html_body: str, plain_body: str,
+             attachments: Optional[List[Attachment]] = None) -> None:
         """发送 HTML + 纯文本双格式邮件。
 
         Raises:
@@ -329,7 +355,8 @@ class EmailSender:
                   "到「邮箱配置」修正并保存后重试。"
             )
 
-        msg = self._build_message(recipients, subject, html_body, plain_body)
+        msg = self._build_message(recipients, subject, html_body, plain_body,
+                                  attachments=attachments)
         last_exc: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -395,10 +422,11 @@ class EmailSender:
     # -------------------------------------------------------------- 内部方法 --
 
     def _build_message(self, recipients: List[str], subject: str,
-                       html_body: str, plain_body: str) -> MIMEMultipart:
+                       html_body: str, plain_body: str,
+                       attachments: Optional[List[Attachment]] = None) -> MIMEMultipart:
         """构建 MIME 邮件（UTF-8）。"""
         return build_mime_message(self._cfg.username, recipients,
-                                  subject, html_body, plain_body)
+                                  subject, html_body, plain_body, attachments=attachments)
 
     def _smtp_send(self, recipients: List[str],
                    msg: MIMEMultipart) -> None:
@@ -458,6 +486,52 @@ def _fmt_cn(d) -> str:
     return f"{d.year}年{d.month}月{d.day}日"
 
 
+def build_table_rows(items: List[ReminderItem]) -> List[Dict[str, str]]:
+    """按客户汇总，正文与附件共用相同的五列和行顺序。"""
+    grouped: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for item in items:
+        key = (item.customer_id, item.customer_name)
+        row = grouped.setdefault(key, dict(zip(TABLE_COLUMNS, (*key, "", "", ""))))
+        column = _PERMISSION_COLUMN.get(item.perm) or _PERMISSION_COLUMN.get(item.perm_label)
+        if column is None:
+            raise ValueError(f"无法归入汇总表的权限：{item.perm_label}")
+        expiry = item.expiry.isoformat()
+        # 极少数重复客户行含不同日期时全部保留，避免后来的记录覆盖先前日期。
+        dates = row[column].split("; ") if row[column] else []
+        if expiry not in dates:
+            row[column] = "; ".join([*dates, expiry])
+    return list(grouped.values())
+
+
+def build_excel_attachment(items: List[ReminderItem],
+                           detected_at: Optional[datetime] = None) -> Attachment:
+    """生成与正文相同的五列表格；自由文本始终写为文本，不作为公式执行。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    detected_at = detected_at or datetime.now()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "权限到期提醒"
+    values = [dict(zip(TABLE_COLUMNS, TABLE_COLUMNS)), *build_table_rows(items)]
+    for row_number, row in enumerate(values, start=1):
+        for column_number, header in enumerate(TABLE_COLUMNS, start=1):
+            cell = sheet.cell(row_number, column_number, row[header])
+            cell.data_type = "s"
+            cell.number_format = "@"
+            if row_number == 1:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor="EAF0F7")
+    for column in sheet.columns:
+        sheet.column_dimensions[column[0].column_letter].width = min(
+            max(len(str(cell.value or "")) for cell in column) + 4, 30)
+    sheet.freeze_panes = "C2"
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return f"权限到期{detected_at:%Y%m%d%H%M%S}.xlsx", output.getvalue()
+
+
 def render_summary_email(items: List[ReminderItem],
                          today) -> Tuple[str, str]:
     """把当日待提醒项渲染为汇总邮件（HTML, 纯文本）。
@@ -473,19 +547,17 @@ def render_summary_email(items: List[ReminderItem],
     if has_backfill:
         header += "（标注【补发】的为错过往常提醒时点的补发提醒）"
 
-    # ---- HTML 部分 ----
-    rows = []
+    table_rows = build_table_rows(items)
+    rows = ["<tr>" + "".join(f"<td>{_esc(row[column]) or '&mdash;'}</td>"
+                              for column in TABLE_COLUMNS) + "</tr>"
+            for row in table_rows]
+    details = []
     for it in items:
         backfill_tag = '<span style="color:#c0392b;">【补发】</span>' if it.is_backfill else ""
-        rows.append(
-            "<tr>"
-            f"<td>{_esc(it.customer_id)}</td>"
-            f"<td>{_esc(it.customer_name) or '&mdash;'}</td>"
-            f"<td>{_esc(it.perm_label)}</td>"
-            f"<td>{_fmt_cn(it.expiry)}</td>"
-            f"<td>{_fmt_cn(it.trigger_date)}</td>"
-            f"<td>{backfill_tag or '&mdash;'}</td>"
-            "</tr>"
+        details.append(
+            f"<li>{backfill_tag}{_esc(it.customer_id)} {_esc(it.customer_name)}："
+            f"{_esc(it.perm_label)}，到期日期 {_fmt_cn(it.expiry)}，"
+            f"原提醒时点 {_fmt_cn(it.trigger_date)}</li>"
         )
     html_body = f"""\
 <div style="font-family:'Microsoft YaHei',SimSun,sans-serif;max-width:720px;">
@@ -494,23 +566,27 @@ def render_summary_email(items: List[ReminderItem],
   <table border="1" cellspacing="0" cellpadding="6"
          style="border-collapse:collapse;font-size:14px;">
     <tr style="background:#d6eaf8;font-weight:bold;">
-      <td>客户号</td><td>客户姓名</td><td>权限</td>
-      <td>到期日期</td><td>原提醒时点</td><td>备注</td>
+      {''.join(f'<th>{column}</th>' for column in TABLE_COLUMNS)}
     </tr>
     {''.join(rows)}
   </table>
+  <p>同结构明细见 Excel 附件。提醒时点与补发说明：</p>
+  <ul>{''.join(details)}</ul>
   <p style="color:#7f8c8d;font-size:12px;">
     本邮件由权限到期提醒工具于 {_fmt_cn(today)} 自动发送，请勿直接回复。
   </p>
 </div>"""
 
     # ---- 纯文本部分 ----
-    lines = [SUBJECT, "", header, ""]
+    lines = [SUBJECT, "", header, "", "\t".join(TABLE_COLUMNS)]
+    lines += ["\t".join(row[column] for column in TABLE_COLUMNS) for row in table_rows]
+    lines += ["", "同结构明细见 Excel 附件。提醒时点与补发说明："]
     for it in items:
         tag = "【补发】" if it.is_backfill else ""
         lines.append(
             f"{tag}客户号：{it.customer_id}　客户姓名：{it.customer_name or '—'}　"
-            f"{it.perm_label}　到期日期：{_fmt_cn(it.expiry)}"
+            f"{it.perm_label}　到期日期：{_fmt_cn(it.expiry)}　"
+            f"原提醒时点：{_fmt_cn(it.trigger_date)}"
         )
     lines += ["", f"本邮件由权限到期提醒工具于 {_fmt_cn(today)} 自动发送，请勿直接回复。"]
     plain_body = "\n".join(lines)

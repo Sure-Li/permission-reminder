@@ -32,11 +32,12 @@ import subprocess
 import sys
 import urllib.parse
 from datetime import datetime
+from html import escape
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from ..infra.config_store import DATA_DIR
-from .sender import build_mime_message
+from .sender import Attachment, build_mime_message
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +88,12 @@ def _unique_path(folder: Path, stem: str, suffix: str) -> Path:
 def _html_document(subject: str, html_body: str) -> str:
     """给正文套一层最小外壳，保证浏览器以 UTF-8 正确渲染。"""
     return ("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-            f"<title>{subject}</title></head><body>{html_body}</body></html>")
+            f"<title>{escape(subject)}</title></head><body>{html_body}</body></html>")
 
 
 def export_eml(recipients: List[str], subject: str, html_body: str,
                plain_body: str, from_addr: str = "",
-               tag: str = "") -> Path:
+               tag: str = "", attachments: Optional[List[Attachment]] = None) -> Path:
     """把邮件写成本地 .eml 文件，返回文件路径。
 
     Args:
@@ -104,7 +105,8 @@ def export_eml(recipients: List[str], subject: str, html_body: str,
         tag:        文件名前缀，便于人工区分（如"权限到期提醒"）。
     """
     path = _unique_path(outbox_dir(), f"{_safe_name(tag or subject)}_{_stamp()}", ".eml")
-    msg = build_mime_message(from_addr, recipients, subject, html_body, plain_body)
+    msg = build_mime_message(from_addr, recipients, subject, html_body, plain_body,
+                             attachments=attachments)
     path.write_bytes(msg.as_bytes())
     logger.info("已导出邮件到本地: %s", path)
     return path
@@ -120,13 +122,14 @@ def export_html(subject: str, html_body: str, tag: str = "") -> Path:
 
 def export_mail(recipients: List[str], subject: str, html_body: str,
                 plain_body: str, from_addr: str = "",
-                tag: str = "") -> Tuple[Path, Path]:
+                tag: str = "", attachments: Optional[List[Attachment]] = None) -> Tuple[Path, Path]:
     """一次性导出 .eml 与 .html，返回 (eml 路径, html 路径)。"""
     folder = outbox_dir()
     stem = f"{_safe_name(tag or subject)}_{_stamp()}"
 
     eml_path = _unique_path(folder, stem, ".eml")
-    msg = build_mime_message(from_addr, recipients, subject, html_body, plain_body)
+    msg = build_mime_message(from_addr, recipients, subject, html_body, plain_body,
+                             attachments=attachments)
     eml_path.write_bytes(msg.as_bytes())
 
     # html 与 eml 使用同一 stem；eml 已占位时给 html 也带上同样后缀，便于成对识别
@@ -246,7 +249,7 @@ def build_mailto(recipients: List[str], subject: str, plain_body: str) -> str:
 
 
 def open_in_mail_client(recipients: List[str], subject: str,
-                        plain_body: str) -> bool:
+                        plain_body: str, eml_path: Optional[Path] = None) -> bool:
     """唤起系统默认邮件客户端的新建邮件窗口（收件人/主题/正文摘要已预填）。
 
     Returns:
@@ -259,6 +262,20 @@ def open_in_mail_client(recipients: List[str], subject: str,
       - 只是"打开写信窗口"，最终仍需用户点发送——这正是让已配置好的
         Foxmail/Outlook 用它自己的凭据投递，从而绕开 SMTP 认证被拒的问题。
     """
+    if eml_path is not None:
+        # mailto 没有可移植的附件参数；附件提醒必须打开完整 MIME 文件。
+        path = Path(eml_path).resolve(strict=True)
+        if sys.platform.startswith("win"):
+            handler = _query_assoc(".eml", 2).lower()
+            if not handler or any(marker in handler for marker in _NO_HANDLER_MARKERS):
+                logger.warning("系统没有可用的 .eml 关联，请手动发送导出的完整邮件")
+                return False
+            os.startfile(str(path))  # type: ignore[attr-defined]  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)  # noqa: S603,S607
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)  # noqa: S603,S607
+        return True
     if sys.platform.startswith("win") and not has_mail_client():
         logger.warning("系统未设置默认邮件客户端（mailto 无关联），跳过自动唤起，"
                        "改为由用户手动发送导出的 .eml")
